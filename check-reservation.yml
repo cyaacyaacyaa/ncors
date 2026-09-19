@@ -1,0 +1,40 @@
+name: Check Reservation
+
+on:
+  schedule:
+    # 10分おきに実行 (UTC基準。GitHub側の負荷で数分遅延することがあります)
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}   # 手動実行用ボタンも使えるようにする
+
+permissions:
+  contents: write   # notified_slots.json をコミットし直すために必要
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run reservation check
+        env:
+          NCORS_USERID: ${{ secrets.NCORS_USERID }}
+          NCORS_PASSWORD: ${{ secrets.NCORS_PASSWORD }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python3 check_reservation.py
+
+      - name: Save updated state back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add notified_slots.json
+          git diff --staged --quiet || git commit -m "update notified slots [skip ci]"
+          git push
