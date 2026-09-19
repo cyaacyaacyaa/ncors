@@ -31,14 +31,6 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python3 check_reservation.py
 
-      - name: Test Discord webhook (一時的なテスト用・確認後は削除してOK)
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -X POST -H "Content-Type: application/json" \
-            -d '{"content": "🔔 GitHub Actionsからのテスト通知です"}' \
-            "$DISCORD_WEBHOOK_URL"
-
       - name: Save updated state back to repo
         run: |
           git config user.name "github-actions[bot]"
