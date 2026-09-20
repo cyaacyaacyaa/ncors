@@ -1,9 +1,8 @@
 name: Check Reservation
 
 on:
-  schedule:
-    # 10分おきに実行 (UTC基準。GitHub側の負荷で数分遅延することがあります)
-    - cron: '*/5 * * * *'
+  repository_dispatch:
+    types: [check-reservation]
   workflow_dispatch: {}   # 手動実行用ボタンも使えるようにする
 
 permissions:
