@@ -11,6 +11,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 358   # 5時間58分。スクリプト側のWATCH_DURATION_MINUTES(355分)より少し長めに
     steps:
       - name: Checkout repo
         uses: actions/checkout@v5
@@ -23,11 +24,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run reservation check
+      - name: Run reservation watch
         env:
           NCORS_USERID: ${{ secrets.NCORS_USERID }}
           NCORS_PASSWORD: ${{ secrets.NCORS_PASSWORD }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WATCH_DURATION_MINUTES: '355'   # 最大約6時間(ジョブ上限内)監視を継続
+          WATCH_INTERVAL_SECONDS: '240'   # 4分おきにページ更新 (セッションが5分でタイムアウトするため)
         run: python3 check_reservation.py
 
       - name: Save updated state back to repo
