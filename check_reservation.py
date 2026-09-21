@@ -3,20 +3,40 @@
 """
 ポートアイランドドライビングスクール 教習予約の空き枠チェック → Discord通知
 
+【方式】
+  ログインは起動時に1回だけ行い、その後は同じセッション(COOKIEトークン)のまま
+  「最新の内容に更新する」相当のページ再取得(reservelist.aspへの再POST)だけを
+  繰り返して監視する。
+
+  - セッションは約5分でタイムアウトするため、更新間隔はそれより短く設定し、
+    ログアウトを検知した場合は自動で再ログインする。
+  - 受付時間(9:00〜21:00 JST)の間だけ動作し、それ以外の時間帯は何もせず終了する。
+  - GitHub Actions等、1ジョブに実行時間の上限があるプラットフォーム向けに、
+    WATCH_DURATION_MINUTES で監視を打ち切る時間を指定できる。
+
 必要な環境変数:
-  NCORS_USERID        教習生番号 (例: F38700)
-  NCORS_PASSWORD       パスワード
-  DISCORD_WEBHOOK_URL  DiscordのWebhook URL
+  NCORS_USERID          教習生番号 (例: F38700)
+  NCORS_PASSWORD         パスワード
+  DISCORD_WEBHOOK_URL    DiscordのWebhook URL
+
+任意の環境変数:
+  NCORS_CARTYPE           車種コード (デフォルト: 002=AT)
+  WATCH_DURATION_MINUTES  監視を継続する最大時間(分)。デフォルト355分
+  WATCH_INTERVAL_SECONDS  ページ更新の間隔(秒)。デフォルト240秒(4分、セッションタイムアウト対策)
+  NCORS_STATE_FILE        既知の空き枠を記録するJSONファイルパス
+  BUSINESS_START_HOUR     受付開始時刻(時)。デフォルト9
+  BUSINESS_END_HOUR       受付終了時刻(時)。デフォルト21
 
 使い方:
   python3 check_reservation.py
-
-定期実行するには cron や GitHub Actions などで一定間隔ごとに実行してください。
 """
 
 import os
 import json
 import sys
+import time
+import random
+from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import quote
 
 import requests
@@ -36,10 +56,41 @@ DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 
 STATE_FILE = os.environ.get("NCORS_STATE_FILE", "notified_slots.json")
 
+WATCH_DURATION_MINUTES = float(os.environ.get("WATCH_DURATION_MINUTES", "355"))
+WATCH_INTERVAL_SECONDS = float(os.environ.get("WATCH_INTERVAL_SECONDS", "240"))
+# ジョブのタイムアウトに引っかからないよう、終了予定時刻の少し手前で切り上げる
+SAFETY_MARGIN_SECONDS = 120
+
+JST = timezone(timedelta(hours=9))
+BUSINESS_START = dtime(int(os.environ.get("BUSINESS_START_HOUR", "9")), 0)
+BUSINESS_END = dtime(int(os.environ.get("BUSINESS_END_HOUR", "21")), 0)
+
 HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=Shift_JIS",
     "User-Agent": "Mozilla/5.0",
 }
+
+HIDDEN_FIELDS = ["USERNAME", "USERSTEP", "CARTYPE", "INSTRUCTOR", "USERDATA", "COOKIE"]
+
+
+class SessionExpired(Exception):
+    """セッションタイムアウト等でログアウトされたことを示す"""
+    pass
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def in_business_hours(dt: datetime = None) -> bool:
+    dt = dt or now_jst()
+    return BUSINESS_START <= dt.time() < BUSINESS_END
+
+
+def seconds_until_business_end(dt: datetime = None) -> float:
+    dt = dt or now_jst()
+    end_dt = dt.replace(hour=BUSINESS_END.hour, minute=BUSINESS_END.minute, second=0, microsecond=0)
+    return max(0.0, (end_dt - dt).total_seconds())
 
 
 def encode_cp932(data: dict) -> bytes:
@@ -60,13 +111,21 @@ def get_hidden(soup: BeautifulSoup, name: str) -> str:
     return tag["value"] if tag and tag.has_attr("value") else ""
 
 
-def login_and_get_reservelist(session: requests.Session) -> str:
-    # 1. ログインページを開いて初期COOKIE値を取得
+def extract_state(soup: BeautifulSoup) -> dict:
+    return {name: get_hidden(soup, name) for name in HIDDEN_FIELDS}
+
+
+def looks_logged_out(soup: BeautifulSoup) -> bool:
+    """ログインページ(USERID/USERPASSWD入力欄)に戻された = セッション切れ"""
+    return soup.find("input", {"name": "USERID"}) is not None
+
+
+def login(session: requests.Session) -> dict:
+    """ログインを1回行い、以後のページ更新に使う状態(hidden fields)を返す"""
     r = session.get(LOGIN_URL)
     soup = BeautifulSoup(get_html(r), "html.parser")
     initial_cookie = get_hidden(soup, "COOKIE")
 
-    # 2. ログインPOST -> cartype.asp (メニュー選択ページ)
     login_data = {
         "USERID": USERID,
         "USERPASSWD": USERPASSWD,
@@ -85,7 +144,6 @@ def login_and_get_reservelist(session: requests.Session) -> str:
             "ログインに失敗した可能性があります。教習生番号・パスワードを確認してください。"
         )
 
-    # 3. 車種選択POST -> ReserveList.asp (空き状況ページ)
     reserve_data = {
         "USERNAME": username,
         "USERSTEP": userstep,
@@ -94,7 +152,28 @@ def login_and_get_reservelist(session: requests.Session) -> str:
         "CARTYPE": CARTYPE,
     }
     r3 = session.post(RESERVE_ACTION, data=encode_cp932(reserve_data), headers=HEADERS)
-    return get_html(r3)
+    soup3 = BeautifulSoup(get_html(r3), "html.parser")
+    if looks_logged_out(soup3):
+        raise RuntimeError("ログイン直後にログイン画面へ戻されました。ID・パスワードを確認してください。")
+    return extract_state(soup3)
+
+
+def reload_reservelist(session: requests.Session, state: dict) -> tuple[str, dict]:
+    """ログインし直さずに、同じセッションのままページだけ再取得する。
+    セッション切れを検知した場合は SessionExpired を送出する。"""
+    payload = {name: state.get(name, "") for name in HIDDEN_FIELDS}
+    r = session.post(RESERVE_ACTION, data=encode_cp932(payload), headers=HEADERS)
+    html = get_html(r)
+    soup = BeautifulSoup(html, "html.parser")
+
+    if looks_logged_out(soup):
+        raise SessionExpired("セッションがタイムアウトしました。")
+
+    new_state = extract_state(soup)
+    for name in HIDDEN_FIELDS:
+        if not new_state.get(name):
+            new_state[name] = state.get(name, "")
+    return html, new_state
 
 
 def parse_free_slots(html: str):
@@ -160,21 +239,73 @@ def main():
         print(f"環境変数が未設定です: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
+    if not in_business_hours():
+        print(
+            f"現在({now_jst().strftime('%H:%M')} JST)は受付時間外"
+            f"({BUSINESS_START.strftime('%H:%M')}〜{BUSINESS_END.strftime('%H:%M')})のため、"
+            "何もせず終了します。"
+        )
+        return
+
     session = requests.Session()
-    html = login_and_get_reservelist(session)
-    free_slots = parse_free_slots(html)
+
+    print("ログイン中...")
+    state = login(session)
+    print("ログイン成功。監視を開始します。")
 
     notified = load_notified()
-    current = set(free_slots)
-    new_slots = current - notified
 
-    if new_slots:
-        print(f"新しい空き枠 {len(new_slots)} 件を通知します。")
-        notify_discord(sorted(new_slots))
-    else:
-        print("新しい空き枠なし。")
+    start = time.monotonic()
+    duration_deadline = start + WATCH_DURATION_MINUTES * 60 - SAFETY_MARGIN_SECONDS
 
-    save_notified(current)
+    first_loop = True
+    while True:
+        if not first_loop:
+            jitter = random.uniform(-0.1, 0.1) * WATCH_INTERVAL_SECONDS
+            time.sleep(max(1.0, WATCH_INTERVAL_SECONDS + jitter))
+
+        if time.monotonic() > duration_deadline:
+            print("監視時間の上限に達したため終了します。")
+            break
+
+        if not in_business_hours():
+            print("受付時間を過ぎたため監視を終了します。")
+            break
+
+        try:
+            html, state = reload_reservelist(session, state)
+        except SessionExpired:
+            print("セッション切れを検知しました。再ログインします。")
+            try:
+                state = login(session)
+            except RuntimeError as e:
+                print(f"再ログイン失敗: {e}", file=sys.stderr)
+                break
+            first_loop = False
+            continue
+        except requests.RequestException as e:
+            print(f"通信エラー: {e}", file=sys.stderr)
+            first_loop = False
+            continue
+
+        free_slots = parse_free_slots(html)
+        current = set(free_slots)
+        new_slots = current - notified
+
+        if new_slots:
+            print(f"新しい空き枠 {len(new_slots)} 件を通知します。")
+            try:
+                notify_discord(sorted(new_slots))
+            except requests.RequestException as e:
+                print(f"Discord通知エラー: {e}", file=sys.stderr)
+        else:
+            print("新しい空き枠なし。")
+
+        notified = current
+        save_notified(notified)
+        first_loop = False
+
+    print("監視を終了しました。")
 
 
 if __name__ == "__main__":
