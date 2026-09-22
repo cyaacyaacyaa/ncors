@@ -31,7 +31,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           WATCH_DURATION_MINUTES: '355'   # 最大約6時間(ジョブ上限内)監視を継続
           WATCH_INTERVAL_SECONDS: '240'   # 4分おきにページ更新 (セッションが5分でタイムアウトするため)
-        run: python3 check_reservation.py
+        run: python3 -u check_reservation.py
 
       - name: Save updated state back to repo
         run: |
